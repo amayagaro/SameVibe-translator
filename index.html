@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SameVibe Slang Translator</title>
-<meta name="samevibe-api" content="https://samevibe.garoamaya.workers.dev">
+<!-- Address of your Cloudflare Worker (worker.js), without a slash at the end -->
+<meta name="samevibe-api" content="COLLE-ICI-L-ADRESSE-DU-WORKER">
 <style>
 :root{
   /* Layout idea: a quiet, almost colourless page whose hero is the working translator.
@@ -569,6 +570,9 @@ var I18N = {
   noAI:["Live translation is not available in this view. Open this page inside Claude to translate your own messages, or try one of the examples below.","La traduction en direct n'est pas disponible dans cette vue. Ouvre cette page dans Claude pour traduire tes propres messages, ou essaie un des exemples ci-dessous.","当前页面无法使用实时翻译。请在 Claude 中打开此页面来翻译自己的消息，或试试下面的示例。"],
   errGrant:["AI translation is turned off for this page. You can still open the examples below.","La traduction par IA est désactivée pour cette page. Tu peux toujours ouvrir les exemples ci-dessous.","此页面的 AI 翻译已关闭。你仍然可以查看下面的示例。"],
   errRate:["Too many requests in a short time. Wait a moment, then try again.","Trop de demandes en peu de temps. Attends un instant, puis réessaie.","请求太频繁了，稍等一下再试。"],
+  instant:["Instant · glossary","Instantané · glossaire","即时 · 词典"],
+  variant:["Variant","Variante","另一种说法"],
+  errSlow:["The model is taking too long to answer. Try again in a moment.","Le modèle met trop de temps à répondre. Réessaie dans un instant.","模型响应太慢，请稍后再试。"],
   errFail:["The translation did not come through. Check your connection and try again.","La traduction n'a pas abouti. Vérifie ta connexion et réessaie.","翻译没有成功。请检查网络后重试。"]
 };
 
@@ -577,7 +581,7 @@ var TXT = [
   ['.links a[href="#translator"]',"navTranslate"], ['.links a[href="#library"]',"navHistory"], ['.links a[href="#slang"]',"navSlang"], ['.links a[href="#how"]',"navHow"],
   [".hero h1","h1"], [".hero .lede","lede"], ['#fromLang option[value="auto"]',"auto"],
   ['[data-mode="same_vibe"]',"m_same_vibe"], ['[data-mode="neutral"]',"m_neutral"], ['[data-mode="explain"]',"m_explain"],
-  ["#exTag","example"], ["#audLab","audLab"],
+  ["#audLab","audLab"],
   ['[data-aud="friend"]',"a_friend"], ['[data-aud="classmate"]',"a_classmate"], ['[data-aud="group"]',"a_group"], ['[data-aud="new"]',"a_new"], ['[data-aud="prof"]',"a_prof"],
   ['label[for="ctxText"]',"ctxLab"], [".hint","hint"], ["#examples > span","tryEx"],
   ["#slangBox h3","hSlang"], ["#replyBox h3","hReply"], ["#toneBox h3","hTone"], ["#meanBox h3","hMean"], ["#altBox h3","hAlt"],
@@ -824,20 +828,43 @@ function use(name){
   return Promise.resolve(null);
 }
 /* Outside Claude (for example on GitHub Pages), translations go through the proxy set in
-   <meta name="samevibe-api">. It returns {text} like Claude's own sample(). */
+   <meta name="samevibe-api">. The answer is read as it streams in, so the translation shows early.
+   The body is sent as plain text on purpose: it avoids an extra "preflight" round trip. */
 function apiSampler(){
   var m = document.querySelector('meta[name="samevibe-api"]');
   var url = m && m.content ? m.content.trim() : "";
-  if(!url) return null;
-  return function(prompt, opts){
-    return fetch(url, {method:"POST", headers:{"content-type":"application/json"},
-      body:JSON.stringify({prompt:prompt}), signal:opts && opts.signal})
+  if(!/^https?:\/\//i.test(url)) return null;
+  function sampler(prompt, opts){
+    opts = opts || {};
+    var c = new AbortController(), timedOut = false, timer = 0;
+    function arm(){ clearTimeout(timer); timer = setTimeout(function(){ timedOut = true; c.abort(); }, 30000); }
+    function onAbort(){ c.abort(); }
+    if(opts.signal){ if(opts.signal.aborted) c.abort(); else opts.signal.addEventListener("abort", onAbort); }
+    arm();
+    return fetch(url, {method:"POST", body:JSON.stringify({prompt:prompt, stream:opts.stream !== false}), signal:c.signal})
     .then(function(r){
       if(r.status === 429) throw {code:"rate_limited"};
       if(!r.ok) throw new Error("http " + r.status);
-      return r.json();
-    });
-  };
+      var type = r.headers.get("content-type") || "";
+      if(type.indexOf("application/json") >= 0) return r.json();
+      if(!r.body || !r.body.getReader) return r.text().then(function(x){ return {text:x}; });
+      var reader = r.body.getReader(), dec = new TextDecoder(), text = "";
+      function pump(){
+        return reader.read().then(function(x){
+          if(x.done){ text += dec.decode(); return {text:text}; }
+          arm();
+          text += dec.decode(x.value, {stream:true});
+          if(opts.onText){ try{ opts.onText({text:text}); }catch(e){} }
+          return pump();
+        });
+      }
+      return pump();
+    })
+    .catch(function(e){ if(timedOut) throw {code:"timeout"}; throw e; })
+    .finally(function(){ clearTimeout(timer); if(opts.signal) opts.signal.removeEventListener("abort", onAbort); });
+  }
+  sampler.isProxy = true;
+  return sampler;
 }
 var sampleP = use("sample").then(function(s){ return s || apiSampler(); });
 var tts = null;
@@ -934,6 +961,36 @@ function exampleEntry(ex, mode){
         alternatives:ex.alternatives.map(function(a){ return {text:a.text, pinyin:a.pinyin || "", label:L(a.label)}; }) } };
 }
 
+/* A message that is exactly one glossary term is answered on the spot, without calling the AI. */
+function wholeTerm(text){
+  var clean = text.trim().replace(/[\s!?.,~\u3002\uff01\uff1f\uff0c\u2026]+$/g, "");
+  if(!clean || clean.length > 24) return null;
+  var hits = findGloss(clean, state.from).filter(function(h){
+    return h.hit.toLowerCase() === clean.toLowerCase() && h.g.l !== state.to && h.g[state.to];
+  });
+  return hits.length === 1 ? hits[0] : null;
+}
+function instantEntry(h, text){
+  var g = h.g, to = state.to, mode = state.mode;
+  var eqs = g[to].split(" / ").map(function(x){ return x.trim(); }).filter(Boolean);
+  var neutral = (/^[^.\u3002]*[.\u3002]?/.exec(g.m[LI[to]] || g.m[0]) || [""])[0].trim() || eqs[0];
+  var alts = mode === "neutral"
+    ? eqs.map(function(x){ return {text:x, pinyin:to === "zh" ? (g.zp || "") : "", label:t("m_same_vibe")}; })
+    : eqs.slice(1).map(function(x){ return {text:x, pinyin:"", label:t("variant")}; }).concat([{text:neutral, pinyin:"", label:t("m_neutral")}]);
+  return { id:"g" + Date.now(), ts:Date.now(), text:text, from:state.from, to:to, mode:mode, instant:true,
+    r:{ detected_language:g.l, translation:mode === "neutral" ? neutral : eqs[0],
+        pinyin:to === "zh" && mode !== "neutral" ? (g.zp || "") : "",
+        explanation:L(g.m) + (g.n ? " " + L(g.n) : ""), register:4, tone_label:L(T_CAS), good_for:L(FRIENDS), careful_with:"",
+        slang:[{term:h.hit, reading:L(g.r), literal:"", meaning:L(g.m), equivalent:eqs[0], equivalent_reading:to === "zh" ? (g.zp || "") : "", tag:""}],
+        alternatives:alts.slice(0, 3) } };
+}
+function remember(entry){
+  var h0 = history_[0];
+  if(h0 && h0.instant && entry.instant && h0.text === entry.text && h0.to === entry.to && h0.mode === entry.mode) history_.shift();
+  history_.unshift(entry); history_ = history_.slice(0, 25); store.set("history", history_);
+  renderLib();
+}
+
 /* ---------- rendering ---------- */
 function renderMode(){
   setRadio(el.seg, "data-mode", state.mode);
@@ -967,7 +1024,8 @@ function show(entry){
   }
   el.out.classList.remove("stale");
   el.out.innerHTML = h;
-  el.exTag.hidden = !entry.example;
+  el.exTag.textContent = t(entry.instant ? "instant" : "example");
+  el.exTag.hidden = !(entry.example || entry.instant);
   el.speak.hidden = !tts;
   renderSaveBtn();
   renderInsights(entry);
@@ -1150,19 +1208,41 @@ glossBlock(text) +
 '"alternatives": exactly 2 objects {"text": another way to say it in the target language, "pinyin": pinyin if Chinese, otherwise "", "label": 2 to 4 words on how it differs}';
 }
 
-function looseParse(txt){
-  var s = String(txt || ""), a = s.indexOf("{"), b = s.lastIndexOf("}");
-  if(a < 0 || b <= a) throw new Error("no json");
-  return JSON.parse(s.slice(a, b + 1));
+function partialTranslation(txt){
+  var m = /"translation"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(String(txt || ""));
+  if(!m) return "";
+  var s = m[1].replace(/\\$/, "");
+  try{ return JSON.parse('"' + s + '"'); }catch(e){ return s.replace(/\\n/g, "\n").replace(/\\"/g, '"'); }
 }
-function askJSON(sample, prompt, signal){
-  var opts = {signal:signal, modelTier:"default"};
-  var p = typeof sample.json === "function" ? sample.json(prompt, opts) : sample(prompt, opts);
+function looseParse(txt, lenient){
+  var s = String(txt || "").replace(/<think>[\s\S]*?<\/think>/g, ""), a = s.indexOf("{"), b = s.lastIndexOf("}");
+  if(a >= 0 && b > a){
+    var body = s.slice(a, b + 1);
+    try{ return JSON.parse(body); }catch(e){
+      try{ return JSON.parse(body.replace(/,\s*([}\]])/g, "$1")); }catch(e2){}
+    }
+  }
+  if(lenient){ var p = partialTranslation(s); if(p) return {translation:p}; }
+  throw new Error("bad json");
+}
+function askJSON(sample, prompt, signal, onText, lenient){
+  var opts = {signal:signal};
+  if(sample.isProxy){ opts.onText = onText; opts.stream = !lenient; } else { opts.modelTier = "default"; }
+  var p = !sample.isProxy && typeof sample.json === "function" ? sample.json(prompt, opts) : sample(prompt, opts);
   return p.then(function(v){
-    if(typeof v === "string") return looseParse(v);
-    if(v && typeof v === "object" && typeof v.text === "string" && !("translation" in v) && !("replies" in v)) return looseParse(v.text);
+    if(typeof v === "string") return looseParse(v, lenient);
+    if(v && typeof v === "object" && typeof v.text === "string" && !("translation" in v) && !("replies" in v)) return looseParse(v.text, lenient);
     if(v && typeof v === "object" && v.value && typeof v.value === "object") return v.value;
     return v;
+  });
+}
+/* One retry through the proxy when the first answer is cut or malformed; the second try is not streamed. */
+function ask(sample, prompt, signal, onText){
+  return askJSON(sample, prompt, signal, onText, false).catch(function(e){
+    var code = e && e.code;
+    if(signal.aborted || !sample.isProxy || code === "rate_limited" || code === "timeout") throw e;
+    try{ console.warn("SameVibe: retrying after", e && (e.message || e.code)); }catch(x){}
+    return askJSON(sample, prompt, signal, null, true);
   });
 }
 function normalize(v){
@@ -1187,6 +1267,7 @@ function failKey(e, fallback){
   var code = e && e.code;
   if(code === "not_granted") return "errGrant";
   if(code === "rate_limited") return "errRate";
+  if(code === "timeout") return "errSlow";
   return fallback;
 }
 function setBusy(on){ busy = on; el.go.disabled = on; el.go.textContent = t(on ? "going" : "go"); }
@@ -1202,6 +1283,17 @@ function translate(opts){
     show(exampleEntry(ex, state.mode)); return;
   }
 
+  if(!el.ctx.value.trim()){
+    var whole = wholeTerm(text);
+    if(whole){
+      if(ctl) ctl.abort();
+      setBusy(false); state.example = null;
+      var quick = instantEntry(whole, text);
+      show(quick); remember(quick);
+      return;
+    }
+  }
+
   if(ctl) ctl.abort();
   var my = ctl = new AbortController();
   setBusy(true);
@@ -1215,14 +1307,19 @@ function translate(opts){
     if(my.signal.aborted) return;
     if(!sample){ setBusy(false); hintOut("noAI"); return; }
     var snap = {from:state.from, to:state.to, mode:state.mode};
-    return askJSON(sample, buildPrompt(text), my.signal).then(function(v){
+    var shown = "";
+    function onText(o){
+      if(my.signal.aborted) return;
+      var p = partialTranslation(o.text);
+      if(p && p !== shown){ shown = p; el.out.innerHTML = '<p class="out-main" lang="' + snap.to + '">' + esc(p) + "</p>" + skeleton(); }
+    }
+    return ask(sample, buildPrompt(text), my.signal, onText).then(function(v){
       if(my.signal.aborted) return;
       var entry = {id:"t" + Date.now(), ts:Date.now(), text:text, from:snap.from, to:snap.to, mode:snap.mode, r:normalize(v)};
       state.example = null;
       setBusy(false);
       show(entry);
-      history_.unshift(entry); history_ = history_.slice(0, 25); store.set("history", history_);
-      renderLib();
+      remember(entry);
     });
   }).catch(function(e){
     if(my.signal.aborted) return;
@@ -1250,7 +1347,7 @@ function suggestReplies(){
   var c = new AbortController();
   sampleP.then(function(sample){
     if(!sample){ el.replyBtn.hidden = true; el.replyList.innerHTML = '<p class="t">' + esc(t("replyNoAI")) + "</p>"; return; }
-    return askJSON(sample, prompt, c.signal).then(function(v){
+    return ask(sample, prompt, c.signal).then(function(v){
       var list = (v && Array.isArray(v.replies) ? v.replies : []).slice(0, 3).map(function(a){ a = a || {};
         return {text:S(a.text, 600), pinyin:S(a.pinyin, 900), meaning:S(a.meaning, 300), label:S(a.label, 40)}; })
         .filter(function(a){ return a.text; });
@@ -1308,7 +1405,7 @@ el.ui.addEventListener("change", function(){
 el.src.addEventListener("input", function(){
   updateCount();
   if(cur && el.src.value.trim() !== cur.text){ el.out.classList.add("stale"); el.exTag.hidden = true; el.detected.textContent = ""; }
-  else if(cur){ el.out.classList.remove("stale"); el.exTag.hidden = !cur.example; }
+  else if(cur){ el.out.classList.remove("stale"); el.exTag.hidden = !(cur.example || cur.instant); }
 });
 el.src.addEventListener("keydown", function(e){
   if(e.key === "Enter" && (e.metaKey || e.ctrlKey)){ e.preventDefault(); translate({scroll:true}); }
