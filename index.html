@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SameVibe Slang Translator</title>
+<meta name="samevibe-api" content="COLLE-ICI-L-ADRESSE-DU-WORKER">
 <style>
 :root{
   /* Layout idea: a quiet, almost colourless page whose hero is the working translator.
@@ -822,7 +823,23 @@ function use(name){
   }catch(e){}
   return Promise.resolve(null);
 }
-var sampleP = use("sample");
+/* Outside Claude (for example on GitHub Pages), translations go through the proxy set in
+   <meta name="samevibe-api">. It returns {text} like Claude's own sample(). */
+function apiSampler(){
+  var m = document.querySelector('meta[name="samevibe-api"]');
+  var url = m && m.content ? m.content.trim() : "";
+  if(!url) return null;
+  return function(prompt, opts){
+    return fetch(url, {method:"POST", headers:{"content-type":"application/json"},
+      body:JSON.stringify({prompt:prompt}), signal:opts && opts.signal})
+    .then(function(r){
+      if(r.status === 429) throw {code:"rate_limited"};
+      if(!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    });
+  };
+}
+var sampleP = use("sample").then(function(s){ return s || apiSampler(); });
 var tts = null;
 
 /* ---------- state ---------- */
